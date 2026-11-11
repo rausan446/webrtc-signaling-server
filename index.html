@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101418">
+<title>Live Camera</title>
+<style>
+  :root { --bg:#101418; --panel:#1a2026; --line:#2b343c; --text:#e8edf1; --dim:#8b98a3; --accent:#3ddc97; --danger:#ff6b5e; }
+  * { box-sizing: border-box; }
+  html,body { margin:0; background:var(--bg); color:var(--text); font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  body { min-height:100dvh; padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom); display:flex; flex-direction:column; align-items:center; }
+  main { width:100%; max-width:560px; padding:24px 0; display:flex; flex-direction:column; gap:16px; }
+  h1 { font-size:1.4rem; margin:0; font-weight:650; }
+  p.sub { margin:0; color:var(--dim); font-size:.95rem; line-height:1.45; }
+  label { font-size:.9rem; color:var(--dim); display:block; margin-bottom:6px; }
+  input { width:100%; padding:14px; font-size:1rem; border-radius:10px; border:1px solid var(--line); background:var(--panel); color:var(--text); }
+  input:focus-visible, button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  .row { display:flex; gap:10px; }
+  button { flex:1; padding:15px; font-size:1rem; font-weight:600; border-radius:10px; border:1px solid var(--line); background:var(--panel); color:var(--text); cursor:pointer; }
+  button.primary { background:var(--accent); color:#06281a; border-color:var(--accent); }
+  button.danger { background:var(--danger); color:#2b0a06; border-color:var(--danger); }
+  button:disabled { opacity:.5; }
+  .stage { position:relative; background:#000; border-radius:12px; overflow:hidden; aspect-ratio:3/4; border:1px solid var(--line); }
+  video { width:100%; height:100%; object-fit:contain; background:#000; }
+  .status { display:flex; align-items:center; gap:8px; font-size:.9rem; color:var(--dim); min-height:1.4em; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--dim); flex:none; }
+  .dot.live { background:var(--danger); }
+  .dot.ok { background:var(--accent); }
+  .hidden { display:none !important; }
+  .note { font-size:.8rem; color:var(--dim); line-height:1.4; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Live Camera</h1>
+
+  <section id="setup">
+    <p class="sub">Use the same stream key on both devices. Anyone with the key can watch, so make it hard to guess.</p>
+    <div style="height:14px"></div>
+    <label for="room">Stream key</label>
+    <input id="room" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="e.g. blue-tiger-4829">
+    <div style="height:14px"></div>
+    <div class="row">
+      <button class="primary" id="btnBroadcast">Start streaming</button>
+      <button id="btnWatch">Watch stream</button>
+    </div>
+  </section>
+
+  <section id="live" class="hidden">
+    <div class="stage"><video id="video" autoplay playsinline muted></video></div>
+    <div style="height:12px"></div>
+    <div class="status"><span class="dot" id="dot"></span><span id="status">Starting…</span></div>
+    <div style="height:12px"></div>
+    <div class="row">
+      <button id="btnFlip" class="hidden">Flip camera</button>
+      <button id="btnMute" class="hidden">Unmute</button>
+      <button id="btnStop" class="danger">Stop</button>
+    </div>
+    <p class="note" id="note"></p>
+  </section>
+</main>
+
+<script>
+// ---- Settings -------------------------------------------------------------
+// STUN works on many networks. For reliable streaming over mobile data,
+// add a TURN server here (e.g. from metered.ca or Cloudflare):
+//   { urls: 'turn:your.turn.server:3478', username: '...', credential: '...' }
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+];
+// ---------------------------------------------------------------------------
+
+const $ = (id) => document.getElementById(id);
+const video = $('video');
+const myId = Math.random().toString(36).slice(2, 10);
+
+let ws, role, room, stopped = false;
+let localStream = null, facing = 'environment', wakeLock = null;
+const peers = {};          // broadcaster: viewerId -> RTCPeerConnection
+let viewerPc = null;       // viewer's connection
+let queue = Promise.resolve();
+
+$('room').value = localStorage.getItem('streamKey') || '';
+
+function setStatus(text, kind) {
+  $('status').textContent = text;
+  $('dot').className = 'dot ' + (kind || '');
+}
+function showLive() { $('setup').classList.add('hidden'); $('live').classList.remove('hidden'); }
+
+function connectWS() {
+  const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+  ws = new WebSocket(url);
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: 'join', room }));
+    if (role === 'broadcaster') {
+      setStatus('Live. Waiting for viewers…', 'live');
+      send({ type: 'broadcaster-ready', to: '*' });
+    } else {
+      setStatus('Connected. Looking for the stream…');
+      send({ type: 'viewer-join', to: 'broadcaster' });
+    }
+  };
+  ws.onmessage = (e) => {
+    let msg; try { msg = JSON.parse(e.data); } catch { return; }
+    queue = queue.then(() => handle(msg)).catch(console.error);
+  };
+  ws.onclose = () => {
+    if (stopped) return;
+    setStatus('Reconnecting…');
+    setTimeout(() => { if (!stopped) connectWS(); }, 2000);
+  };
+}
+function send(obj) {
+  obj.from = myId;
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+}
+
+// ---- Broadcaster ----------------------------------------------------------
+async function startCamera() {
+  if (localStream) localStream.getTracks().forEach(t => t.stop());
+  localStream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 24 } },
+    audio: true,
+  });
+  video.srcObject = localStream;
+  video.muted = true;
+}
+
+async function startBroadcast() {
+  role = 'broadcaster';
+  try { await startCamera(); }
+  catch (e) { alert('Could not open the camera: ' + e.message + '\nAllow camera access and use https.'); return; }
+  showLive();
+  $('btnFlip').classList.remove('hidden');
+  $('note').textContent = 'Keep this screen on and the page open. Locking the phone stops the camera.';
+  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+  connectWS();
+}
+
+async function addViewer(viewerId) {
+  if (peers[viewerId]) { peers[viewerId].close(); }
+  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  peers[viewerId] = pc;
+  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  pc.onicecandidate = (e) => { if (e.candidate) send({ type: 'candidate', to: viewerId, candidate: e.candidate }); };
+  pc.onconnectionstatechange = () => {
+    if (['failed', 'closed', 'disconnected'].includes(pc.connectionState)) {
+      if (peers[viewerId] === pc) { pc.close(); delete peers[viewerId]; }
+    }
+    const n = Object.keys(peers).length;
+    setStatus(n ? `Live. ${n} viewer${n > 1 ? 's' : ''} watching` : 'Live. Waiting for viewers…', 'live');
+  };
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  send({ type: 'offer', to: viewerId, sdp: pc.localDescription });
+}
+
+// ---- Viewer ---------------------------------------------------------------
+function startWatch() {
+  role = 'viewer';
+  showLive();
+  $('btnMute').classList.remove('hidden');
+  $('note').textContent = 'If nothing appears, make sure the broadcasting phone has started streaming with the same key.';
+  connectWS();
+}
+
+async function handleOffer(msg) {
+  if (viewerPc) viewerPc.close();
+  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  viewerPc = pc;
+  pc.ontrack = (e) => { video.srcObject = e.streams[0]; video.play().catch(() => {}); };
+  pc.onicecandidate = (e) => { if (e.candidate) send({ type: 'candidate', to: 'broadcaster', target: msg.from, candidate: e.candidate }); };
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'connected') setStatus('Watching live', 'ok');
+    else if (pc.connectionState === 'connecting') setStatus('Connecting…');
+    else if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
+      setStatus('Connection lost. Retrying…');
+      setTimeout(() => { if (!stopped && role === 'viewer') send({ type: 'viewer-join', to: 'broadcaster' }); }, 2000);
+    }
+  };
+  await pc.setRemoteDescription(msg.sdp);
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  send({ type: 'answer', to: 'broadcaster', target: msg.from, sdp: pc.localDescription });
+}
+
+// ---- Message router -------------------------------------------------------
+async function handle(msg) {
+  if (role === 'broadcaster') {
+    if (msg.to !== 'broadcaster') return;
+    if (msg.type === 'viewer-join') await addViewer(msg.from);
+    else if (msg.type === 'answer' && peers[msg.from]) await peers[msg.from].setRemoteDescription(msg.sdp);
+    else if (msg.type === 'candidate' && peers[msg.from]) await peers[msg.from].addIceCandidate(msg.candidate).catch(() => {});
+  } else if (role === 'viewer') {
+    if (msg.type === 'broadcaster-ready') { send({ type: 'viewer-join', to: 'broadcaster' }); return; }
+    if (msg.to !== myId) return;
+    if (msg.type === 'offer') await handleOffer(msg);
+    else if (msg.type === 'candidate' && viewerPc) await viewerPc.addIceCandidate(msg.candidate).catch(() => {});
+  }
+}
+
+// ---- UI wiring ------------------------------------------------------------
+function getRoom() {
+  room = $('room').value.trim();
+  if (room.length < 4) { alert('Enter a stream key with at least 4 characters.'); return false; }
+  localStorage.setItem('streamKey', room);
+  return true;
+}
+$('btnBroadcast').onclick = () => { if (getRoom()) startBroadcast(); };
+$('btnWatch').onclick = () => { if (getRoom()) startWatch(); };
+$('btnFlip').onclick = async () => {
+  facing = facing === 'environment' ? 'user' : 'environment';
+  try {
+    await startCamera();
+    const track = localStream.getVideoTracks()[0];
+    const audio = localStream.getAudioTracks()[0];
+    Object.values(peers).forEach(pc => pc.getSenders().forEach(s => {
+      if (s.track && s.track.kind === 'video') s.replaceTrack(track);
+      if (s.track && s.track.kind === 'audio' && audio) s.replaceTrack(audio);
+    }));
+  } catch (e) { alert('Could not switch camera: ' + e.message); }
+};
+$('btnMute').onclick = () => {
+  video.muted = !video.muted;
+  $('btnMute').textContent = video.muted ? 'Unmute' : 'Mute';
+};
+$('btnStop').onclick = () => {
+  stopped = true;
+  if (ws) ws.close();
+  Object.values(peers).forEach(pc => pc.close());
+  if (viewerPc) viewerPc.close();
+  if (localStream) localStream.getTracks().forEach(t => t.stop());
+  if (wakeLock) wakeLock.release().catch(() => {});
+  location.reload();
+};
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && role === 'broadcaster' && !stopped && 'wakeLock' in navigator) {
+    try { wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+  }
+});
+</script>
+</body>
+</html>
